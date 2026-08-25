@@ -1,0 +1,72 @@
+version: '3'
+
+vars:
+  BIN_DIR: bin
+  GIT_VERSION:
+    sh: git describe --always --tags --dirty
+  GIT_COMMIT:
+    sh: git rev-parse HEAD
+  GIT_BRANCH:
+    sh: git branch --show-current
+  GIT_LAST_TAG:
+    sh: git describe --tags --abbrev=0 || echo ""
+  LDFLAGS: "-s -w -X main.version={{.GIT_VERSION}} -X main.commit={{.GIT_COMMIT}} -X 'main.date={{now | date \"02.01.2006 15:04\"}}'"
+  L: "{{\"{{\"}}"
+  R: "{{\"}}\"}}"
+
+tasks:
+  default:
+    cmds:
+      - task -l
+
+  build:
+    desc: Build with CGO
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - echo "Building with CGO for linux/amd64..."
+      - CGO_ENABLED=1 go build -ldflags="{{.LDFLAGS}}" -o {{.BIN_DIR}}/ ./cmd/...
+
+  build-lite:
+    desc: Build without CGO (dummy audio)
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - echo "Building without CGO (dummy audio) for linux/amd64..."
+      - CGO_ENABLED=0 go build -ldflags="{{.LDFLAGS}}" -tags=!cgo -o {{.BIN_DIR}}/net-ptt-lite ./cmd/net-ptt
+
+  build-macos:
+    desc: Build for macOS (current arch) with CGO, using Homebrew opus/opusfile/libogg
+    vars:
+      PKG_CONFIG_PATH:
+        sh: echo "$(brew --prefix opus)/lib/pkgconfig:$(brew --prefix opusfile)/lib/pkgconfig:$(brew --prefix libogg)/lib/pkgconfig"
+    cmds:
+      - mkdir -p {{.BIN_DIR}}
+      - PKG_CONFIG_PATH="{{.PKG_CONFIG_PATH}}" CGO_ENABLED=1 go build -ldflags="{{.LDFLAGS}}" -o {{.BIN_DIR}}/ ./cmd/net-ptt
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BIN_DIR}}
+
+  test:
+    desc: Run tests
+    cmds:
+      - echo "Running tests..."
+      - go test -v ./...
+
+  lint:
+    desc: Run linters
+    cmds:
+      - echo "Running linters..."
+      - |
+        if command -v golangci-lint >/dev/null 2>&1; then
+          golangci-lint run
+        else
+          echo "golangci-lint not found, skipping..."
+        fi
+
+  deps:
+    desc: Download dependencies
+    cmds:
+      - echo "Downloading dependencies..."
+      - go mod download
+      - go mod tidy
