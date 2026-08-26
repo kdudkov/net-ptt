@@ -100,7 +100,8 @@ func main() {
 				continue
 			}
 
-			header := rtp.BuildRTPHeader(seq, ts, ssrc, rtp.OpusPayloadType)
+			marker := (r == 0 && i == 0) || i == 0
+			header := rtp.BuildRTPHeader(seq, ts, ssrc, rtp.OpusPayloadType, marker)
 			packet := append(header, out[:n]...)
 
 			_, err = conn.Write(packet)

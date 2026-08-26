@@ -5,6 +5,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -12,15 +13,18 @@ import (
 	"github.com/kdudkov/net-ptt/internal/config"
 )
 
+type rxCheckMsg struct{}
+
 // Model is the bubbletea model for the channel picker / PTT screen.
 type Model struct {
 	client   *client.CommsClient
 	channels []config.Channel
 	cursor   int
 
-	transmitting    bool
-	supportKeyRelease bool
-	statusMsg        string
+	transmitting       bool
+	supportKeyRelease  bool
+	receiving          bool
+	statusMsg          string
 }
 
 // New builds the initial model, placing the cursor on initialChannel.
@@ -36,7 +40,9 @@ func New(c *client.CommsClient, channels []config.Channel, initialChannel int) M
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg {
+		return rxCheckMsg{}
+	})
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -85,6 +91,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.transmitting = false
 			m.client.StopTransmit()
 		}
+
+	case rxCheckMsg:
+		m.receiving = m.client.IsReceiving()
+		return m, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg {
+			return rxCheckMsg{}
+		})
 	}
 
 	return m, nil
@@ -104,12 +116,17 @@ func (m Model) View() tea.View {
 
 	b.WriteString(fmt.Sprintf("Network PTT\n\n"))
 
+	greenStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	for i, ch := range m.channels {
 		prefix := "  "
 		if i == m.cursor {
 			prefix = "> "
 		}
-		fmt.Fprintf(&b, "%s%s (port %d)\n", prefix, ch.Name, ch.Port)
+		name := ch.Name
+		if m.receiving && i == m.cursor {
+			name = greenStyle.Render(name)
+		}
+		fmt.Fprintf(&b, "%s%s (port %d)\n", prefix, name, ch.Port)
 	}
 
 	b.WriteString("\n")

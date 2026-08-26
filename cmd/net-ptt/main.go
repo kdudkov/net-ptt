@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	flagInterface     = flag.String("interface", "en0", "Network interface for multicast")
+	flagInterface     = flag.String("interface", "", "Network interface for multicast (empty = system default)")
 	flagMulticastAddr = flag.String("multicast-addr", "239.192.41.1", "Multicast address")
 
 	flagInputDevice  = flag.String("input-device", "0", "Audio input device name or index [REQUIRED]")

@@ -116,7 +116,11 @@ func ApplyDefaults(cfg *ClientConfig) {
 	}
 
 	if cfg.Interface == "" {
-		cfg.Interface = DefaultInterface
+		if name := defaultInterfaceName(); name != "" {
+			cfg.Interface = name
+		} else {
+			cfg.Interface = DefaultInterface
+		}
 	}
 
 	if cfg.SampleRate == 0 {
@@ -170,4 +174,40 @@ func Channels() []Channel {
 		})
 	}
 	return channels
+}
+
+// defaultInterfaceName finds the network interface that the kernel's
+// default route points at. It works by doing a UDP "dial" to a public
+// address (no packets are actually sent for UDP) and looking up which
+// interface owns the source IP the kernel chose.
+func defaultInterfaceName() string {
+	conn, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return ""
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				if ipnet.IP.Equal(localAddr.IP) {
+					return iface.Name
+				}
+			}
+		}
+	}
+	return ""
 }

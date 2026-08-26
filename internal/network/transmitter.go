@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
-	"time"
 
 	"github.com/kdudkov/net-ptt/internal/audio"
 	"github.com/kdudkov/net-ptt/internal/rtp"
@@ -19,7 +18,9 @@ type TransmitterPort struct {
 
 	ssrc          uint32
 	seqNum        atomic.Uint32
+	timestamp     uint32
 	txEnabled     atomic.Bool
+	talkspurt     bool
 	txCount       atomic.Int64
 	encodeErrors  atomic.Int64
 	droppedFrames atomic.Int64
@@ -39,6 +40,7 @@ func NewTransmitterPort(iface string, multicastAddr *net.UDPAddr, ssrc uint32, e
 		capture:   capture,
 		ssrc:      ssrc,
 		txEnabled: atomic.Bool{},
+		talkspurt: true,
 		logger:    logger,
 	}
 
@@ -59,10 +61,11 @@ func (tp *TransmitterPort) processFrame(pcm []int16) {
 		return
 	}
 
-	seq := tp.seqNum.Add(1)
-	ts := uint32(time.Now().UnixNano() / 25)
+	seq := uint16(tp.seqNum.Add(1) - 1)
+	marker := tp.talkspurt
+	tp.talkspurt = false
 
-	header := rtp.BuildRTPHeader(uint16(seq-1), ts, tp.ssrc, rtp.OpusPayloadType)
+	header := rtp.BuildRTPHeader(seq, tp.timestamp, tp.ssrc, rtp.OpusPayloadType, marker)
 	packet := append(header, payload...)
 
 	if _, err := tp.conn.Write(packet); err != nil {
@@ -70,6 +73,8 @@ func (tp *TransmitterPort) processFrame(pcm []int16) {
 		tp.droppedFrames.Add(1)
 		return
 	}
+
+	tp.timestamp += uint32(len(pcm))
 	tp.txCount.Add(1)
 }
 
@@ -82,6 +87,7 @@ func (tp *TransmitterPort) Start(ctx context.Context) error {
 func (tp *TransmitterPort) SetTxEnabled(enabled bool) {
 	tp.txEnabled.Store(enabled)
 	if enabled {
+		tp.talkspurt = true
 		tp.capture.StartTX(tp.processFrame)
 	} else {
 		tp.capture.StopTX()

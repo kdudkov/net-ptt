@@ -21,7 +21,6 @@ type CommsClient struct {
 
 	malgoCtx *malgo.AllocatedContext
 
-	decoder  *audio.Decoder
 	encoder  *audio.Encoder
 	playback *audio.PlaybackStream
 	capture  *audio.CaptureStream
@@ -72,11 +71,6 @@ func (c *CommsClient) initAudio() error {
 		return fmt.Errorf("failed to initialize malgo: %w", err)
 	}
 	c.malgoCtx = malgoCtx
-
-	c.decoder, err = audio.NewDecoder(c.config.SampleRate, c.config.Channels, c.logger)
-	if err != nil {
-		return fmt.Errorf("failed to create decoder: %w", err)
-	}
 
 	c.encoder, err = audio.NewEncoder(
 		c.config.SampleRate,
@@ -144,7 +138,8 @@ func (c *CommsClient) buildPorts(channel int) (*network.ReceiverPort, *network.T
 		c.config.MulticastAddr,
 		port,
 		c.ssrc,
-		c.decoder,
+		c.config.SampleRate,
+		c.config.Channels,
 		c.playback,
 		c.logger,
 	)
@@ -188,6 +183,15 @@ func (c *CommsClient) SwitchChannel(channel int) error {
 		oldTx.SetTxEnabled(false)
 	}
 
+	// Stop old ports before starting new ones to avoid goroutine leaks
+	// and concurrent decoder access
+	if oldRecv != nil {
+		oldRecv.Close()
+	}
+	if oldTx != nil {
+		oldTx.Close()
+	}
+
 	if err := recvPort.Start(c.ctx); err != nil {
 		recvPort.Close()
 		txPort.Close()
@@ -202,13 +206,6 @@ func (c *CommsClient) SwitchChannel(channel int) error {
 	c.recvPort = recvPort
 	c.txPort = txPort
 	c.config.Channel = channel
-
-	if oldRecv != nil {
-		oldRecv.Close()
-	}
-	if oldTx != nil {
-		oldTx.Close()
-	}
 
 	c.logger.Info().Int("channel", channel).Msg("Switched channel")
 	return nil
@@ -241,6 +238,22 @@ func (c *CommsClient) IsTransmitting() bool {
 	txPort := c.txPort
 	c.mu.RUnlock()
 	return txPort != nil && txPort.IsTxEnabled()
+}
+
+func (c *CommsClient) IsReceiving() bool {
+	c.mu.RLock()
+	recvPort := c.recvPort
+	c.mu.RUnlock()
+	if recvPort == nil {
+		return false
+	}
+	return recvPort.IsReceiving()
+}
+
+func (c *CommsClient) CurrentChannel() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.config.Channel
 }
 
 func (c *CommsClient) Start() error {
@@ -289,8 +302,15 @@ func (c *CommsClient) runStats() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			rxCnt, parseErrs, decErrs, plcCnt := c.recvPort.GetStats()
-			txCnt, encErrs, dropped := c.txPort.GetStats()
+			c.mu.RLock()
+			recvPort := c.recvPort
+			txPort := c.txPort
+			c.mu.RUnlock()
+			if recvPort == nil || txPort == nil {
+				continue
+			}
+			rxCnt, parseErrs, decErrs, plcCnt := recvPort.GetStats()
+			txCnt, encErrs, dropped := txPort.GetStats()
 			duration := time.Since(c.startTime).Seconds()
 
 			c.logger.Info().
@@ -340,10 +360,6 @@ func (c *CommsClient) Shutdown() {
 
 	if c.playback != nil {
 		c.playback.Close()
-	}
-
-	if c.decoder != nil {
-		c.decoder.Close()
 	}
 
 	if c.encoder != nil {

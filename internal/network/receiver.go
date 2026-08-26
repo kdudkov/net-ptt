@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kdudkov/net-ptt/internal/audio"
@@ -50,6 +51,7 @@ func (jb *JitterBuffer) Push(seq uint16, payload []byte) {
 	idx := seq % uint16(jb.maxDepth)
 	slot := &jb.slots[idx]
 
+	// Exact duplicate — skip
 	if slot.valid && slot.seq == seq {
 		jb.lastPush = time.Now()
 		return
@@ -57,6 +59,11 @@ func (jb *JitterBuffer) Push(seq uint16, payload []byte) {
 
 	if jb.count >= jb.maxDepth {
 		return
+	}
+
+	// Overwriting a valid slot with a different seq — old packet is lost
+	if slot.valid {
+		jb.count--
 	}
 
 	buf := make([]byte, len(payload))
@@ -131,15 +138,20 @@ type ReceiverPort struct {
 	playback *audio.PlaybackStream
 	ownSSRC  uint32
 
-	rxCount      int64
-	parseErrors  int64
-	decodeErrors int64
-	plcCount     int64
+	rxCount      atomic.Int64
+	parseErrors  atomic.Int64
+	decodeErrors atomic.Int64
+	plcCount     atomic.Int64
+	lastRxTime   atomic.Int64
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	logger zerolog.Logger
 }
 
-func NewReceiverPort(iface string, multicastAddr string, port string, ownSSRC uint32, decoder *audio.Decoder, playback *audio.PlaybackStream, logger zerolog.Logger) (*ReceiverPort, error) {
+func NewReceiverPort(iface string, multicastAddr string, port string, ownSSRC uint32, sampleRate, channels int, playback *audio.PlaybackStream, logger zerolog.Logger) (*ReceiverPort, error) {
 	ifaceObj, err := net.InterfaceByName(iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get interface %s: %w", iface, err)
@@ -154,6 +166,12 @@ func NewReceiverPort(iface string, multicastAddr string, port string, ownSSRC ui
 
 	if err := pc.JoinGroup(ifaceObj, &net.UDPAddr{IP: net.ParseIP(multicastAddr)}); err != nil {
 		return nil, err
+	}
+
+	decoder, err := audio.NewDecoder(sampleRate, channels, logger)
+	if err != nil {
+		pc.Close()
+		return nil, fmt.Errorf("failed to create decoder: %w", err)
 	}
 
 	logger.Info().
@@ -173,17 +191,20 @@ func NewReceiverPort(iface string, multicastAddr string, port string, ownSSRC ui
 }
 
 func (rp *ReceiverPort) Start(ctx context.Context) error {
-	go rp.receiveLoop(ctx)
-	go rp.playoutLoop(ctx)
+	rp.ctx, rp.cancel = context.WithCancel(ctx)
+	rp.wg.Add(2)
+	go rp.receiveLoop()
+	go rp.playoutLoop()
 	return nil
 }
 
-func (rp *ReceiverPort) receiveLoop(ctx context.Context) {
+func (rp *ReceiverPort) receiveLoop() {
+	defer rp.wg.Done()
 	buf := make([]byte, 4096)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rp.ctx.Done():
 			return
 		default:
 			rp.pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
@@ -192,11 +213,12 @@ func (rp *ReceiverPort) receiveLoop(ctx context.Context) {
 				continue
 			}
 
-			rp.rxCount++
+			rp.rxCount.Add(1)
+			rp.lastRxTime.Store(time.Now().UnixNano())
 
 			packet, err := rtp.ParsePacket(buf[:n])
 			if err != nil {
-				rp.parseErrors++
+				rp.parseErrors.Add(1)
 				rp.logger.Debug().Err(err).Msg("Failed to parse RTP packet")
 				continue
 			}
@@ -205,9 +227,10 @@ func (rp *ReceiverPort) receiveLoop(ctx context.Context) {
 				continue
 			}
 
-			if rp.rxCount <= 10 || rp.rxCount%50 == 0 {
+			rxCount := rp.rxCount.Load()
+			if rxCount <= 10 || rxCount%50 == 0 {
 				rp.logger.Debug().
-					Int64("rxCount", rp.rxCount).
+					Int64("rxCount", rxCount).
 					Uint16("seq", packet.Header.Sequence).
 					Int("payloadLen", len(packet.Payload)).
 					Msg("recv")
@@ -218,13 +241,14 @@ func (rp *ReceiverPort) receiveLoop(ctx context.Context) {
 	}
 }
 
-func (rp *ReceiverPort) playoutLoop(ctx context.Context) {
+func (rp *ReceiverPort) playoutLoop() {
+	defer rp.wg.Done()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-rp.ctx.Done():
 			return
 		case <-ticker.C:
 			payload, conceal, idle := rp.jitter.PopOrConceal()
@@ -237,18 +261,18 @@ func (rp *ReceiverPort) playoutLoop(ctx context.Context) {
 			if payload != nil {
 				_, err := rp.decoder.DecodeS16(payload, out)
 				if err != nil {
-					rp.decodeErrors++
+					rp.decodeErrors.Add(1)
 					rp.logger.Warn().Err(err).Int("payloadLen", len(payload)).Msg("decode error")
 					continue
 				}
 			} else if conceal {
 				_, err := rp.decoder.DecodeS16(nil, out)
 				if err != nil {
-					rp.decodeErrors++
+					rp.decodeErrors.Add(1)
 					rp.logger.Warn().Err(err).Msg("plc error")
 					continue
 				}
-				rp.plcCount++
+				rp.plcCount.Add(1)
 			}
 
 			rp.playback.Play(int16ToBytes(out))
@@ -266,10 +290,25 @@ func int16ToBytes(data []int16) []byte {
 }
 
 func (rp *ReceiverPort) GetStats() (rxCount int64, parseErrors int64, decodeErrors int64, plcCount int64) {
-	return rp.rxCount, rp.parseErrors, rp.decodeErrors, rp.plcCount
+	return rp.rxCount.Load(), rp.parseErrors.Load(), rp.decodeErrors.Load(), rp.plcCount.Load()
+}
+
+func (rp *ReceiverPort) IsReceiving() bool {
+	t := rp.lastRxTime.Load()
+	if t == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, t)) < 500*time.Millisecond
 }
 
 func (rp *ReceiverPort) Close() error {
+	if rp.cancel != nil {
+		rp.cancel()
+	}
+	rp.wg.Wait()
+	if rp.decoder != nil {
+		rp.decoder.Close()
+	}
 	if rp.pc != nil {
 		return rp.pc.Close()
 	}
